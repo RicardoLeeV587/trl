@@ -61,7 +61,7 @@ git clone https://github.com/huggingface/trl.git
 
 ## Command Line Interface (CLI)
 
-You can use the TRL Command Line Interface (CLI) to quickly get started with Supervised Fine-tuning (SFT) and Direct Preference Optimization (DPO), or vibe check your model with the chat CLI: 
+You can use the TRL Command Line Interface (CLI) to quickly get started with post-training methods like Supervised Fine-Tuning (SFT) or Direct Preference Optimization (DPO):
 
 **SFT:**
 
@@ -77,12 +77,6 @@ trl sft --model_name_or_path Qwen/Qwen2.5-0.5B \
 trl dpo --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
     --dataset_name argilla/Capybara-Preferences \
     --output_dir Qwen2.5-0.5B-DPO 
-```
-
-**Chat:**
-
-```bash
-trl chat --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct
 ```
 
 Read more about CLI in the [relevant documentation section](https://huggingface.co/docs/trl/main/en/clis) or use `--help` for more details.
@@ -137,39 +131,26 @@ trainer = RewardTrainer(
 trainer.train()
 ```
 
-### `RLOOTrainer`
+### `GRPOTrainer`
 
-`RLOOTrainer` implements a [REINFORCE-style optimization](https://huggingface.co/papers/2402.14740) for RLHF that is more performant and memory-efficient than PPO. Here is a basic example of how to use the `RLOOTrainer`:
+`GRPOTrainer` implements the [Group Relative Policy Optimization (GRPO) algorithm](https://huggingface.co/papers/2402.03300) that is more memory-efficient than PPO and was used to train [Deepseek AI's R1](https://huggingface.co/deepseek-ai/DeepSeek-R1).
 
 ```python
-from trl import RLOOConfig, RLOOTrainer, apply_chat_template
 from datasets import load_dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-)
+from trl import GRPOConfig, GRPOTrainer
 
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-reward_model = AutoModelForSequenceClassification.from_pretrained(
-    "Qwen/Qwen2.5-0.5B-Instruct", num_labels=1
-)
-ref_policy = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-policy = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+dataset = load_dataset("trl-lib/tldr", split="train")
 
-dataset = load_dataset("trl-lib/ultrafeedback-prompt")
-dataset = dataset.map(apply_chat_template, fn_kwargs={"tokenizer": tokenizer})
-dataset = dataset.map(lambda x: tokenizer(x["prompt"]), remove_columns="prompt")
+# Dummy reward function: rewards completions that are close to 20 characters
+def reward_len(completions, **kwargs):
+    return [-abs(20 - len(completion)) for completion in completions]
 
-training_args = RLOOConfig(output_dir="Qwen2.5-0.5B-RL")
-trainer = RLOOTrainer(
-    config=training_args,
-    processing_class=tokenizer,
-    policy=policy,
-    ref_policy=ref_policy,
-    reward_model=reward_model,
-    train_dataset=dataset["train"],
-    eval_dataset=dataset["test"],
+training_args = GRPOConfig(output_dir="Qwen2-0.5B-GRPO", logging_steps=10)
+trainer = GRPOTrainer(
+    model="Qwen/Qwen2-0.5B-Instruct",
+    reward_funcs=reward_len,
+    args=training_args,
+    train_dataset=dataset,
 )
 trainer.train()
 ```
