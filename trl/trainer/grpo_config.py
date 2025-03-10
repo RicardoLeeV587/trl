@@ -84,6 +84,12 @@ class GRPOConfig(TrainingArguments):
             support this feature.
         vllm_guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
             Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled.
+        
+        # Deprecated
+        vllm_init_kwargs (`dict`, *optional*, defaults to `{"device": "auto", "gpu_memory_utilization": 0.9}`):
+            Keyword arguments for vLLM engine. Common parameters include: 'device' (str, defaults to 'auto'):
+            Device where vLLM generation will run; 'gpu_memory_utilization' (float, defaults to 0.9): Ratio of
+            GPU memory to reserve. Any other valid vLLM engine parameters can be included in this dictionary.
 
         > Parameters that control the training
 
@@ -128,6 +134,14 @@ class GRPOConfig(TrainingArguments):
         log_completions (`bool`, *optional*, defaults to `False`):
             Whether to log a sample of (prompt, completion) pairs every `logging_steps` steps. If `rich` is
             installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`.
+        <qunash>
+        enable_profiling: bool = field(
+            default=False,
+            metadata={
+                "help": "Whether to print profiling information about generation and logit computation times."
+            },
+        )
+        <\qunash>
     """
 
     # Parameters that control the model and reference model
@@ -232,6 +246,20 @@ class GRPOConfig(TrainingArguments):
         default=None,
         metadata={"help": "Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled."},
     )
+    
+    # <qunash> Deprecated
+    vllm_init_kwargs: Optional[dict] = field(
+        default_factory=lambda: {
+            "device": "auto",
+            "gpu_memory_utilization": 0.9,
+        },
+        metadata={
+            "help": "Keyword arguments for vLLM engine. Common parameters include: 'device' (str, defaults to 'auto'): "
+            "Device where vLLM generation will run; 'gpu_memory_utilization' (float, defaults to 0.9): Ratio of "
+            "GPU memory to reserve. Any other valid vLLM engine parameters can be included in this dictionary."
+        },
+    )
+    # <\qunash>
 
     # Parameters that control the training
     learning_rate: float = field(
@@ -312,5 +340,12 @@ class GRPOConfig(TrainingArguments):
             "which is the default. Using a low value will reduce memory usage with tradeoff of slower computation. "
             "However, since the training speed bottleneck occurs in the generation step, it is recommended to utilize "
             "this argument, especially when dealing with larger LLMs."
+        },
+    )
+
+    enable_profiling: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to print profiling information about generation and logit computation times."
         },
     )

@@ -454,7 +454,7 @@ class GRPOTrainer(Trainer):
                 )
 
             if self.accelerator.is_main_process:
-                vllm_device = self.args.vllm_device
+                vllm_device = self.args.vllm_init_kwargs.get("device")
                 if vllm_device == "auto":
                     if torch.cuda.device_count() == 1:
                         vllm_device = "cuda:0"  # particular case when training with onyl 1 GPU: share it
@@ -494,6 +494,8 @@ class GRPOTrainer(Trainer):
                         # This is particularly useful here because we generate completions from the same prompts.
                         enable_prefix_caching=self.args.vllm_enable_prefix_caching,
                         max_model_len=self.args.vllm_max_model_len,
+                        # Deprecated
+                        **self.args.vllm_init_kwargs,
                     )
 
                 # Guided decoding, if enabled
@@ -742,11 +744,21 @@ class GRPOTrainer(Trainer):
                 prompt_completion_ids = unwrapped_model.generate(
                     prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
                 )
-
+        # <andyl89>        
             # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
+        # <\andyl89>
+        # <qunash>
+        end_time = time.perf_counter()
+        if self.accelerator.is_main_process and self.args.enable_profiling:
+            print(f"Generation took {end_time - start_time:0.4f} seconds")
+
+        # Compute prompt length and extract completion ids
+        prompt_length = prompt_inputs["input_ids"].size(1)
+        completion_ids = prompt_completion_ids[:, prompt_length:]
+        # <\qnash> 
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -816,6 +828,13 @@ class GRPOTrainer(Trainer):
                             mini_batch_size=mini_batch_size,
                             requires_grad_for_completion=False,
                         )
+        end_time = time.perf_counter()
+        if self.accelerator.is_main_process and self.args.enable_profiling:
+            print(f"Logits computation took {end_time - start_time:0.4f} seconds")
+
+        # Deprecated
+        # Compute the KL divergence between the model and the reference model
+        # per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
