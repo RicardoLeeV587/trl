@@ -19,6 +19,7 @@ from collections import defaultdict
 from typing import Any, Callable, Optional, Sized, Union
 from unittest.mock import patch
 
+import time
 import torch
 import torch.utils.data
 import transformers
@@ -495,7 +496,7 @@ class GRPOTrainer(Trainer):
                         enable_prefix_caching=self.args.vllm_enable_prefix_caching,
                         max_model_len=self.args.vllm_max_model_len,
                         # Deprecated
-                        **self.args.vllm_init_kwargs,
+                        # **self.args.vllm_init_kwargs,
                     )
 
                 # Guided decoding, if enabled
@@ -744,7 +745,7 @@ class GRPOTrainer(Trainer):
                 prompt_completion_ids = unwrapped_model.generate(
                     prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
                 )
-        # <andyl89>        
+        # <andyl89>
             # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
@@ -754,10 +755,6 @@ class GRPOTrainer(Trainer):
         end_time = time.perf_counter()
         if self.accelerator.is_main_process and self.args.enable_profiling:
             print(f"Generation took {end_time - start_time:0.4f} seconds")
-
-        # Compute prompt length and extract completion ids
-        prompt_length = prompt_inputs["input_ids"].size(1)
-        completion_ids = prompt_completion_ids[:, prompt_length:]
         # <\qnash> 
 
         # Mask everything after the first EOS token
