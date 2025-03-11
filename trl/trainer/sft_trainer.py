@@ -41,7 +41,6 @@ from transformers import (
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalPrediction
 from transformers.utils import is_liger_kernel_available, is_peft_available
-from transformers.utils.deprecation import deprecate_kwarg
 
 from ..data_utils import is_conversational, maybe_apply_chat_template, maybe_convert_to_chatml, pack_examples
 from .sft_config import SFTConfig
@@ -136,9 +135,6 @@ class SFTTrainer(Trainer):
 
     _tag_names = ["trl", "sft"]
 
-    @deprecate_kwarg(
-        "tokenizer", "0.16.0", "processing_class", warn_if_greater_or_equal_version=True, raise_if_both_names=True
-    )
     def __init__(
         self,
         model: Union[str, nn.Module, PreTrainedModel],
@@ -440,24 +436,24 @@ class SFTTrainer(Trainer):
 
             # Pack or truncate
             if packing:
-                if args.max_seq_length is None:
-                    raise ValueError("When packing is enabled, `max_seq_length` can't be `None`.")
+                if args.max_length is None:
+                    raise ValueError("When packing is enabled, `max_length` can't be `None`.")
                 if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                     map_kwargs["desc"] = f"Packing {dataset_name} dataset"
                 dataset = dataset.select_columns("input_ids")
                 dataset = dataset.map(
-                    pack_examples, batched=True, fn_kwargs={"seq_length": args.max_seq_length}, **map_kwargs
+                    pack_examples, batched=True, fn_kwargs={"seq_length": args.max_length}, **map_kwargs
                 )
-            elif args.max_seq_length is not None:
+            elif args.max_length is not None:
                 if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                     map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
 
-                def truncate(example, max_seq_length):
-                    return {key: example[key][:max_seq_length] for key in ["input_ids", "attention_mask"]}
+                def truncate(example, max_length):
+                    return {key: example[key][:max_length] for key in ["input_ids", "attention_mask"]}
 
                 dataset = dataset.map(
                     truncate,
-                    fn_kwargs={"max_seq_length": args.max_seq_length},
+                    fn_kwargs={"max_length": args.max_length},
                     **map_kwargs,
                 )
 

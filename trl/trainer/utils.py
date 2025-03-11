@@ -31,8 +31,6 @@ import torch.utils.data
 from accelerate import Accelerator, PartialState
 from accelerate.state import AcceleratorState
 from huggingface_hub import ModelCard, ModelCardData
-from rich.console import Console
-from rich.table import Table
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import IterableDataset
 from transformers import (
@@ -52,8 +50,15 @@ from transformers.utils import (
     is_torch_xpu_available,
 )
 
+from ..import_utils import is_rich_available
 from ..trainer.model_config import ModelConfig
 
+
+if is_rich_available():
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
 
 if is_comet_available():
     import comet_ml
@@ -140,7 +145,7 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
                     warnings.warn(
                         f"Could not find response key `{self.response_template}` in the following instance: "
                         f"{self.tokenizer.decode(batch['input_ids'][i])}. This instance will be ignored in loss "
-                        "calculation. Note, if this happens often, consider increasing the `max_seq_length`.",
+                        "calculation. Note, if this happens often, consider increasing the `max_length`.",
                         UserWarning,
                     )
                     batch["labels"][i, :] = self.ignore_index
@@ -167,7 +172,7 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
                     warnings.warn(
                         f"Could not find response key `{self.response_template}` in the following instance: "
                         f"{self.tokenizer.decode(batch['input_ids'][i])}. This instance will be ignored in loss "
-                        "calculation. Note, if this happens often, consider increasing the `max_seq_length`.",
+                        "calculation. Note, if this happens often, consider increasing the `max_length`.",
                         UserWarning,
                     )
                     batch["labels"][i, :] = self.ignore_index
@@ -182,7 +187,7 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
                     warnings.warn(
                         f"Could not find instruction key `{self.instruction_template}` in the following instance: "
                         f"{self.tokenizer.decode(batch['input_ids'][i])}. This instance will be ignored in loss "
-                        "calculation. Note, if this happens often, consider increasing the `max_seq_length`.",
+                        "calculation. Note, if this happens often, consider increasing the `max_length`.",
                         UserWarning,
                     )
                     batch["labels"][i, :] = self.ignore_index
@@ -1650,6 +1655,103 @@ def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> tuple[torch.Tensor
         return mask, *tensors
 
 
+def _compute_logps_with_prompt_cache(
+    model: torch.nn.Module,
+    prompt_inputs: dict,
+    completion_ids: torch.LongTensor,
+    mini_batch_size: int,
+    requires_grad_for_completion: bool = True,
+) -> torch.FloatTensor:
+    """
+    The method will compute the log probabilities of the completion tokens by using the prompt cache.
+    1) Forward pass on the prompt with torch.no_grad() to get `past_key_values`.
+    2) Forward pass (with or without grad) on the completion tokens using that cache.
+    3) Compute per-token log probabilities for the completion.
+
+    Args:
+        model (`nn.Module`): A causal LM (transformers.AutoModelForCausalLM) or similar.
+        prompt_inputs (`dict`): The dict of prompt tensors, e.g. {"input_ids", "attention_mask", ...}.
+        completion_ids (`torch.LongTensor`): Shape [B*G, completion_len].
+        mini_batch_size (`int`): The number of completion rows to process at once.
+        requires_grad_for_completion (`bool`): Whether to enable gradient for the completion pass.
+
+    Returns:
+        per_token_logps (`torch.FloatTensor`): shape [B*G, completion_len],
+        where per_token_logps[i, t] is the logprob of ith completion's t-th completion token,
+        given all preceding tokens in the prompt + the partial completion up to t-1.
+    """
+
+    # Get the batch size (B), number of completions (G), and completion length (C)
+    B = prompt_inputs["input_ids"].size(0)
+    G = completion_ids.size(0) // B
+    C = completion_ids.size(1)
+
+    # If the user did not specify a mini_batch_size, use the full batch size (B*G)
+    if mini_batch_size <= 0:
+        mini_batch_size = completion_ids.size(0)
+
+    # Forward pass over prompt tokens to get 2 things with torch.no_grad:
+    # 1) `past_key_values` (KV cache)
+    # 2) `prompt_last_logps` (the logprobs of the first completion token prediction)
+    with torch.no_grad():
+        prompt_out = model(**prompt_inputs, use_cache=True, num_logits_to_keep=1)
+
+    # Only keep the last prompt logit, immediately convert to log probabilities and expand to B*G
+    prompt_last_logps = prompt_out.logits[:, -1:].log_softmax(dim=-1).repeat_interleave(G, dim=0)
+
+    # Gather the these log probs as they relates to the first completion token
+    first_completion_token_logps = torch.gather(
+        prompt_last_logps, dim=-1, index=completion_ids[:, :1].unsqueeze(-1)
+    ).squeeze(-1)
+
+    # Expand the KV Cache `G` times to match the dimension of completion_ids (B -> B*G) and split into mini-batches
+    repeated_kv_cache = prompt_out.past_key_values  # a DynamicCache
+    repeated_kv_cache.batch_repeat_interleave(G)
+    mini_batch_kv_caches = repeated_kv_cache.batch_split(full_batch_size=B * G, split_size=mini_batch_size)
+
+    # Process completion tokens in mini-batches
+    completion_token_logps = []
+
+    for batch_idx, mini_batch_kv_cache in enumerate(mini_batch_kv_caches):
+        start_idx = batch_idx * mini_batch_size
+        end_idx = start_idx + mini_batch_size
+        mini_batch_ids = completion_ids[start_idx:end_idx]  # (mini_batch_size, C)
+
+        with torch.set_grad_enabled(requires_grad_for_completion):
+            mini_batch_logits = model(
+                input_ids=mini_batch_ids,
+                past_key_values=mini_batch_kv_cache,
+                num_logits_to_keep=C,
+                use_cache=False,
+            ).logits[:, -C:-1, :]
+
+        # # Original method
+        # mini_batch_log_probs = mini_batch_logits.log_softmax(dim=-1)
+        # del mini_batch_logits
+
+        # mini_batch_token_log_prob = torch.gather(mini_batch_log_probs, dim=-1, index=mini_batch_index).squeeze(-1)
+        # del mini_batch_log_probs
+
+        # More optimized method (https://github.com/huggingface/trl/pull/2773)
+        # Get the corresponding completion token ids and gather the logits for completion_ids w/ idx >= 1
+        mini_batch_index = mini_batch_ids[:, 1:].unsqueeze(-1)  # (mini_batch_size, C-1, 1)
+        mini_batch_token_logits = torch.gather(mini_batch_logits, dim=-1, index=mini_batch_index).squeeze(
+            -1
+        )  # (mini_batch_size, C-1)
+        mini_batch_logsumexp_values = torch.stack(
+            [torch.logsumexp(l, dim=-1) for l in mini_batch_logits]
+        )  # (mini_batch_size, C-1)
+        del mini_batch_logits
+        mini_batch_token_log_prob = mini_batch_token_logits - mini_batch_logsumexp_values  # (mini_batch_size, C-1)
+        completion_token_logps.append(mini_batch_token_log_prob)
+        del mini_batch_token_logits, mini_batch_logsumexp_values, mini_batch_token_log_prob
+
+    # Combine results
+    all_completion_token_logps = torch.cat(completion_token_logps, dim=0)  # (B*G, C-1)
+    return torch.cat([first_completion_token_logps, all_completion_token_logps], dim=1)  # (B*G, C)
+
+# <andyl98>
+
 def selective_log_softmax(logits, index):
     """
     A memory-efficient implementation of the common `log_softmax -> gather` operation.
@@ -1683,3 +1785,154 @@ def selective_log_softmax(logits, index):
             per_token_logps.append(row_per_token_logps)
         per_token_logps = torch.stack(per_token_logps)
     return per_token_logps
+
+
+def print_prompt_completions_sample(prompts: list[str], completions: list[str], rewards: list[int], step: int) -> None:
+    """
+    Print out a sample of model completions to the console.
+
+    This function creates a nicely formatted table showing prompt-completion pairs, useful for monitoring model outputs
+    during training. It requires the `rich` library to be installed.
+
+    Args:
+        prompts (`list[str]`):
+            List of prompts.
+        completions (`list[str]`):
+            List of completions corresponding to the prompts.
+        reward (`list[float]`):
+            List of rewards corresponding to the completions.
+        step (`int`):
+            Current training step number, used in the output title.
+
+    Example:
+    ```python
+    >>> from trl.trainer.utils import print_prompt_completions_sample
+    >>> prompts = ["The sky is", "The sun is"]
+    >>> completions = [" blue.", " in the sky."]
+    >>> rewards = [0.12345, 0.68789]
+    >>> print_prompt_completions_sample(prompts, completions, rewards, 42)
+    ╭─────────────── Step 42 ────────────────╮
+    │ ┏━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━┓ │
+    │ ┃ Prompt     ┃ Completion   ┃ Reward ┃ │
+    │ ┡━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━┩ │
+    │ │ The sky is │  blue.       │   0.12 │ │
+    │ ├────────────┼──────────────┼────────┤ │
+    │ │ The sun is │  in the sky. │   0.68 │ │
+    │ └────────────┴──────────────┴────────┘ │
+    ╰────────────────────────────────────────╯
+    ```
+    """
+    if not is_rich_available():
+        raise ImportError("This feature requires `rich` to be installed. Please install it first: `pip install rich`")
+
+    console = Console()
+    table = Table(show_header=True, header_style="bold white", expand=True)
+
+    # Add columns
+    table.add_column("Prompt", style="bright_yellow")
+    table.add_column("Completion", style="bright_green")
+    table.add_column("Reward", style="bold cyan", justify="right")
+
+    for prompt, completion, reward in zip(prompts, completions, rewards, strict=True):
+        table.add_row(Text(prompt), Text(completion), f"{reward:.2f}")  # Formatting reward to 2 decimal places
+        table.add_section()  # Adds a separator between rows
+
+    panel = Panel(table, expand=False, title=f"Step {step}", border_style="bold white")
+    console.print(panel)
+# <\andyl98>
+# <qunash>
+# VRAM optimized version
+def compute_logps_with_prompt_cache(
+    model: torch.nn.Module,
+    prompt_inputs: dict,
+    completion_ids: torch.LongTensor,
+    mini_batch_size: int,
+    requires_grad_for_completion: bool = True,
+) -> torch.FloatTensor:
+    """
+    Compute log probabilities of completion tokens using prompt cache with optimized memory and computation.
+    
+    Args:
+        model (`nn.Module`): A causal LM (transformers.AutoModelForCausalLM) or similar.
+        prompt_inputs (`dict`): The dict of prompt tensors, e.g. {"input_ids", "attention_mask", ...}.
+        completion_ids (`torch.LongTensor`): Shape [B*G, completion_len].
+        mini_batch_size (`int`): The number of completion rows to process at once.
+        requires_grad_for_completion (`bool`): Whether to enable gradient for the completion pass.
+
+    Returns:
+        per_token_logps (`torch.FloatTensor`): shape [B*G, completion_len]
+    """
+    # Get dimensions
+    B = prompt_inputs["input_ids"].size(0)
+    G = completion_ids.size(0) // B
+    C = completion_ids.size(1)
+    
+    if mini_batch_size <= 0:
+        mini_batch_size = completion_ids.size(0)
+
+    # Preallocate result tensor
+    result = torch.empty((B*G, C), device=completion_ids.device)
+    
+    # Process prompt
+    with torch.no_grad():
+        prompt_out = model(**prompt_inputs, use_cache=True, logits_to_keep=1)
+        
+        # Optimized prompt logprobs computation
+        last_logits = prompt_out.logits[:, -1:]
+        first_token_ids = completion_ids[:, :1].unsqueeze(-1)
+        gathered_prompt_logits = torch.gather(
+            last_logits.repeat_interleave(G, dim=0), 
+            dim=-1, 
+            index=first_token_ids
+        )
+        prompt_logsumexp = torch.logsumexp(last_logits, dim=-1).repeat_interleave(G, dim=0)
+        result[:, 0] = (gathered_prompt_logits - prompt_logsumexp.unsqueeze(-1)).squeeze(-1)
+        
+        del last_logits, gathered_prompt_logits, prompt_logsumexp
+
+    # Expand KV Cache
+    repeated_kv_cache = prompt_out.past_key_values  # a DynamicCache
+    repeated_kv_cache.batch_repeat_interleave(G)
+    mini_batch_kv_caches = repeated_kv_cache.batch_split(full_batch_size=B * G, split_size=mini_batch_size)
+
+    # Create attention mask for completion tokens
+    completion_attention_mask = torch.ones_like(completion_ids)
+    prompt_attention_mask_repeated = prompt_inputs["attention_mask"].repeat_interleave(G, dim=0)
+
+    # Precompute indices for completion tokens
+    next_token_indices = completion_ids[:, 1:].unsqueeze(-1)  # (B*G, C-1, 1)
+
+    # Process completion tokens in mini-batches
+    for batch_idx, mini_batch_kv_cache in enumerate(mini_batch_kv_caches):
+        start_idx = batch_idx * mini_batch_size
+        end_idx = min(start_idx + mini_batch_size, B*G)
+        mini_batch_ids = completion_ids[start_idx:end_idx]  # (mini_batch_size, C)
+        mini_batch_indices = next_token_indices[start_idx:end_idx]
+        mini_batch_attention_mask = torch.cat([
+            prompt_attention_mask_repeated[start_idx:end_idx],
+            completion_attention_mask[start_idx:end_idx]
+        ], dim=1)
+
+        with torch.set_grad_enabled(requires_grad_for_completion):
+            mini_batch_logits = model(
+                input_ids=mini_batch_ids,
+                attention_mask=mini_batch_attention_mask,
+                past_key_values=mini_batch_kv_cache,
+                logits_to_keep=C,
+                use_cache=False,
+            ).logits[:, -C:-1, :]  # (mini_batch_size, C-1, vocab_size)
+
+            # Gather relevant logits and compute logsumexp in one go
+            mini_batch_token_logits = torch.gather(mini_batch_logits, dim=-1, index=mini_batch_indices)
+            mini_batch_logsumexp = torch.logsumexp(mini_batch_logits, dim=-1)
+            
+            # Compute log probs and store directly in result tensor
+            result[start_idx:end_idx, 1:] = (
+                mini_batch_token_logits.squeeze(-1) - mini_batch_logsumexp
+            )
+            
+            # Clear memory as soon as tensors are no longer needed
+            del mini_batch_logits, mini_batch_token_logits, mini_batch_logsumexp
+
+    return result
+# <\qunash>
